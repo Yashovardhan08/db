@@ -11,13 +11,13 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
-#include <poll.h>
+#include <sys/epoll.h>
 #include <arpa/inet.h>
 
 #define ERROR -1
 
 const int MAX_MSG = 4096;
-
+const int MAX_CONNECTIONS = 1000;
 enum {
     STATE_REQ = 0,// reading the request
     STATE_RES = 1,// sending the response
@@ -51,7 +51,7 @@ void process_response(Conn *conn);
     }
 }
 
-void accept_new_connection(std::vector<Conn*> & fd2Conn,int serverSocket){
+void accept_new_connection(std::vector<Conn*> & fd2Conn,int serverSocket,int epFd){
     // accept
     sockaddr_in clientAddress = {};
     socklen_t clientAddrSize = sizeof(clientAddress);
@@ -70,6 +70,11 @@ void accept_new_connection(std::vector<Conn*> & fd2Conn,int serverSocket){
     conn->rBuffSize = 0;
     conn->wBuffSize = 0;
     conn->wBuffSent = 0;
+
+    static struct epoll_event ev;
+    ev.events = EPOLLIN | EPOLLOUT;
+    ev.data.fd = clientSocket;
+    int res = epoll_ctl(epFd, EPOLL_CTL_ADD, clientSocket, &ev);
 
     fd2Conn[clientSocket] = conn;
 }
@@ -223,59 +228,52 @@ int main(int argc, char *argv[]){
     bind(serverSocket,(struct sockaddr*)&serverAddress, sizeof(serverAddress));
 
     // listen
-    listen(serverSocket,3);
+    listen(serverSocket,MAX_CONNECTIONS);
 
     // map of all connections with key as the socket fd
     std::vector<Conn* > fd2Conn;
+    Conn *serverConn = (struct Conn *)malloc(sizeof(struct Conn));
+    conn->fd = serverSocket;
+    fd2Conn.push_back(serverConn);
 
     // set server socket to non blocking
     fd_set_nb(serverSocket);
 
-    std::vector<struct pollfd> poll_args;
+    // create epoll fd
+    int epFd = epoll_create1(MAX_CONNECTIONS);
+    struct epoll_event serverEvent;
+    serverEvent.data.fd = serverSocket;
+    serverEvent.events = EPOLLIN; 
+    int rv = epoll_ctl(epFd,EPOLL_CTL_ADD, serverSocket,&serverEvent);
     while(true){
-        poll_args.clear();
+        // wait for something to do...
+        struct epoll_event events[MAX_CONNECTIONS];
+        int nfds = epoll_wait(epFd, events,
+                              MAX_CONNECTIONS,
+                              30000);
+        if (nfds < 0)
+            printf("Not getting any event in while loop\n");
+            die("Error in epoll_wait!");
 
-        // server fd is put in first position
-        struct pollfd serverFd = {serverSocket,POLL_IN,0};
-        poll_args.push_back(serverFd);
-
-        // set the poll args 
-        for(Conn* conn: fd2Conn){
-            if(!conn)continue;
-
-            struct pollfd pfd = {};
-            pfd.fd = conn->fd;
-            pfd.events = (conn->state == STATE_REQ)?POLL_IN:POLL_OUT;
-            pfd.events |= POLL_ERR;
-            poll_args.push_back(pfd);
-        }
-
-        // poll for active fd
-        int rv = poll(poll_args.data(),(nfds_t)poll_args.size(),100);
-
-        if(rv<0){
-            printf("ERROR Polling all the poll args!\n");
-            return 0;
-        }
-
-        // process active connections
-        for(int i=1;i<poll_args.size();++i){
-            struct pollfd pfd = poll_args[i];
-            if(pfd.revents){
-                Conn* conn = fd2Conn[pfd.fd];
+        // for each ready socket
+        for (int i = 0; i < nfds; i++)
+        {
+            int fd = events[i].data.fd;
+            if(fd == serverSocket){
+                accept_new_connection(fd2Conn, serverSocket, epFd);
+            }
+            else {
+                Conn *conn = fd2Conn[pfd.fd];
                 // connection io
                 process_connection(conn);
-                if(conn->state == STATE_END){
-                    
+                if (conn->state == STATE_END)
+                {
                     fd2Conn[pfd.fd] = NULL;
                     close(conn->fd);
                     free(conn);
                 }
             }
-        }
-
-        if(poll_args[0].revents){
-            accept_new_connection(fd2Conn,serverSocket);
+            
         }
     }
     close(serverSocket);
