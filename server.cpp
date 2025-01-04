@@ -37,8 +37,9 @@ struct Conn {
 };
 
 void process_response(Conn *conn);
+void process_connection(Conn* conn);
 
-    void fd_set_nb(int fd)
+void fd_set_nb(int fd)
 {
     int currFDOptions = fcntl(fd,F_GETFL,0);
     if(currFDOptions<0){
@@ -59,6 +60,7 @@ void accept_new_connection(std::vector<Conn*> & fd2Conn,int serverSocket,int epF
     if (clientSocket < 0){
         printf("ERROR Accepting new client connection!\n");
     }
+    // printf("Accepted on socket: %d\n",clientSocket);
     fd_set_nb(clientSocket);
     if (clientSocket > fd2Conn.size())
     {
@@ -72,14 +74,20 @@ void accept_new_connection(std::vector<Conn*> & fd2Conn,int serverSocket,int epF
     conn->wBuffSent = 0;
 
     static struct epoll_event ev;
-    ev.events = EPOLLIN | EPOLLOUT;
+    // fd_set_nb(clientSocket);
+    ev.events = EPOLLIN |EPOLLOUT;
     ev.data.fd = clientSocket;
     int res = epoll_ctl(epFd, EPOLL_CTL_ADD, clientSocket, &ev);
+
+    if(res<0){
+        printf("ERROR adding new client fd through epoll_ctl with error %d \n",res);
+    }
 
     fd2Conn[clientSocket] = conn;
 }
 
 static bool try_one_request(Conn * conn){
+    // printf("IN TRY ONE REQUEST\n");
     if(conn->rBuffSize<4)return false;// not enough space in buffer
 
     uint32_t len = 0;
@@ -89,6 +97,7 @@ static bool try_one_request(Conn * conn){
         conn->state = STATE_END;
         return false;
     }
+    // printf("LENGTH of message is %d\n",len);
     if(4+len> conn->rBuffSize){
         // Not enough data in buffer, try again in next iteration
         return false;
@@ -114,12 +123,15 @@ bool try_fill_buffer(Conn* conn){
     ssize_t rv = 0;
     do {
         size_t cap = sizeof(conn->rBuff) - conn->rBuffSize;
+        // printf("GOING TO READ IN TRY FILL BUFFER\n");
         rv = read(conn->fd,&conn->rBuff[conn->rBuffSize],cap);
+        // printf("READ rv: %d in TRY FILL BUFFER\n",rv);
     }
     while(rv<0 && errno == EINTR);// EINTR: our call was interrupted by a signal 
 
     if(rv<0 && errno == EAGAIN){// EAGAIN: resource not ready, try again
         // not ready
+        printf("ERROR resource not ready to read!\n");
         return false;
     }
     if(rv<0){
@@ -191,6 +203,7 @@ void process_connection(Conn* conn){
     else {
         printf("ERROR Illegal connection state!\n");
     }
+    // printf("Final connection for %d socket is in state : %d \n",conn->fd,conn->state);
 }
 
 int32_t read_all(int socketFD, char *buf, int32_t len)
@@ -222,7 +235,7 @@ int main(int argc, char *argv[]){
     sockaddr_in serverAddress;
     serverAddress.sin_family = AF_INET;
     serverAddress.sin_port = htons(6969);
-    serverAddress.sin_addr.s_addr = INADDR_ANY;
+    serverAddress.sin_addr.s_addr = ntohl(0);
 
     // bind 
     bind(serverSocket,(struct sockaddr*)&serverAddress, sizeof(serverAddress));
@@ -232,43 +245,44 @@ int main(int argc, char *argv[]){
 
     // map of all connections with key as the socket fd
     std::vector<Conn* > fd2Conn;
-    Conn *serverConn = (struct Conn *)malloc(sizeof(struct Conn));
-    conn->fd = serverSocket;
-    fd2Conn.push_back(serverConn);
 
     // set server socket to non blocking
     fd_set_nb(serverSocket);
 
     // create epoll fd
-    int epFd = epoll_create1(MAX_CONNECTIONS);
+    int epFd = epoll_create1(0);
     struct epoll_event serverEvent;
     serverEvent.data.fd = serverSocket;
-    serverEvent.events = EPOLLIN; 
+    serverEvent.events = EPOLLIN | EPOLLOUT ; 
     int rv = epoll_ctl(epFd,EPOLL_CTL_ADD, serverSocket,&serverEvent);
     while(true){
         // wait for something to do...
         struct epoll_event events[MAX_CONNECTIONS];
         int nfds = epoll_wait(epFd, events,
                               MAX_CONNECTIONS,
-                              30000);
-        if (nfds < 0)
-            printf("Not getting any event in while loop\n");
-            die("Error in epoll_wait!");
-
+                              -1);
+        if (nfds == -1){
+            printf("Error in epoll_wait!\n");
+            break;
+        }
         // for each ready socket
+        // printf("Got connections %d\n",nfds);
         for (int i = 0; i < nfds; i++)
         {
             int fd = events[i].data.fd;
+            // printf("Got connection on : %d, fd2conn size : %d, server socket : %d\n", fd,fd2Conn.size(),serverSocket);
             if(fd == serverSocket){
+                // printf("accepting new conn %d, serverSocket %d\n",fd,serverSocket);
                 accept_new_connection(fd2Conn, serverSocket, epFd);
             }
             else {
-                Conn *conn = fd2Conn[pfd.fd];
+                // printf("Processing old conn %d\n",fd);
+                Conn *conn = fd2Conn[fd];
                 // connection io
                 process_connection(conn);
                 if (conn->state == STATE_END)
                 {
-                    fd2Conn[pfd.fd] = NULL;
+                    fd2Conn[fd] = NULL;
                     close(conn->fd);
                     free(conn);
                 }
