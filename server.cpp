@@ -236,7 +236,7 @@ int main(int argc, char *argv[]){
         poll_args.clear();
 
         // server fd is put in first position
-        struct pollfd serverFd = {serverSocket,POLL_IN,0};
+        struct pollfd serverFd = {serverSocket,POLLIN,0};
         poll_args.push_back(serverFd);
 
         // set the poll args 
@@ -245,8 +245,8 @@ int main(int argc, char *argv[]){
 
             struct pollfd pfd = {};
             pfd.fd = conn->fd;
-            pfd.events = (conn->state == STATE_REQ)?POLL_IN:POLL_OUT;
-            pfd.events |= POLL_ERR;
+            pfd.events = (conn->state == STATE_REQ)?POLLIN:POLLOUT;
+            pfd.events |= POLLERR;
             poll_args.push_back(pfd);
         }
 

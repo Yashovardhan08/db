@@ -3,6 +3,7 @@
 #include <netinet/ip.h>
 #include <unistd.h>
 #include <iostream>
+#include <cstring>
 
 const int MAX_MSG = 4096;
 
