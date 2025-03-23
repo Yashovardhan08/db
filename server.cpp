@@ -14,8 +14,12 @@
 #include <sys/epoll.h>
 #include <arpa/inet.h>
 #include <map>
+#include "hashtable.h"
 
 #define ERROR -1
+#define container_of(ptr, T, member) \
+    ((T *)( (char *)ptr - offsetof(T, member) ))
+
 
 const int MAX_MSG = 4096;
 const int MAX_CONNECTIONS = 1000;
@@ -26,7 +30,17 @@ enum {
     STATE_END = 2,// close the fd
 };
 
-static std::map<std::string, std::string> g_data;
+// static std::map<std::string, std::string> g_data;
+static struct {
+    HashMap db;
+} g_data;
+
+struct Entry {
+    struct HashNode hashNode;
+    // storing key and value as linked each bucket in HashMap can have colliding HashNodes
+    std::string key;
+    std::string value;
+};
 
 struct Conn {
     int fd = -1;
@@ -41,10 +55,20 @@ struct Conn {
     uint8_t wBuff[4+MAX_MSG];
 };
 
-// struct Response{
-//     uint32_t status;
-//     std::vector<uint8_t> data;
-// };
+// Response::status
+enum {
+    RES_OK = 0,
+    RES_ERR = 1,    // error
+    RES_NX = 2,     // key not found
+};
+
+// +--------+---------+
+// | status | data... |
+// +--------+---------+
+struct Response {
+    uint32_t status = 0;
+    std::vector<uint8_t> data;
+};
 
 void process_response(Conn *conn);
 void process_connection(Conn* conn);
@@ -52,6 +76,13 @@ static void process_commands(Conn *conn,std::vector<std::string> &commands);
 static int32_t parse_commands(const uint8_t *startPtr,size_t size,std::vector<std::string> &cmds);
 static bool parse_string(const uint8_t *&ptr,const uint8_t * endPtr,const uint32_t len, std::string & command);
 static bool parse_uint32(const uint8_t *&ptr,const uint8_t * endPtr,uint32_t & len);
+
+// equality comparison for `struct Entry`
+static bool entry_eq(HashNode *lhs, HashNode *rhs) {
+    struct Entry *le = container_of(lhs, struct Entry, hashNode);
+    struct Entry *re = container_of(rhs, struct Entry, hashNode);
+    return le->key == re->key;
+}
 
 
 void fd_set_nb(int fd)
@@ -132,24 +163,83 @@ static bool try_one_request(Conn * conn){
     return (conn->state == STATE_REQ);
 }
 
+// FNV hash
+static uint64_t str_hash(const uint8_t *data, size_t len) {
+    uint32_t h = 0x811C9DC5;
+    for (size_t i = 0; i < len; i++) {
+        h = (h + data[i]) * 0x01000193;
+    }
+    return h;
+}
+
+static void do_get(std::string &key, Response &response){
+    // create an entry with same key for lookup
+    Entry dummyEntry;
+    dummyEntry.key.swap(key);
+    dummyEntry.hashNode.hcode = str_hash((uint8_t *)dummyEntry.key.data(), dummyEntry.key.size());
+
+    HashNode * hashNode = hashMapLookup(&g_data.db, &dummyEntry.hashNode, &entry_eq);
+    if (!hashNode) {
+        response.status = RES_NX;
+        return;
+    }
+    const std::string &val = container_of(hashNode,Entry, hashNode)->value;
+    assert(val.size() <= MAX_MSG);
+    response.data.assign(val.begin(),val.end());
+}
+
+static void do_set(std::string &key, std::string& value, Response &response){
+    // create an entry with same key for lookup
+    Entry dummyEntry;
+    dummyEntry.key.swap(key);
+    dummyEntry.hashNode.hcode = str_hash((uint8_t *)dummyEntry.key.data(), dummyEntry.key.size());
+    
+    HashNode * hashNode = hashMapLookup(&g_data.db, &dummyEntry.hashNode, &entry_eq);
+    // if exists update
+    if (hashNode) {
+        container_of(hashNode,Entry,hashNode)->value.swap(value);
+    } else {
+    // else delete
+        Entry *newEntry = new Entry();
+        newEntry->key.swap(dummyEntry.key);
+        newEntry->hashNode.hcode = dummyEntry.hashNode.hcode;
+        newEntry->value.swap(value);
+        hashMapInsert(&g_data.db, &newEntry->hashNode);
+    }
+}
+
+static void do_del(std::string &key,Response &response){
+    // create an entry with same key for lookup
+    Entry dummyEntry;
+    dummyEntry.key.swap(key);
+    dummyEntry.hashNode.hcode = str_hash((uint8_t *)dummyEntry.key.data(), dummyEntry.key.size());
+    HashNode* hashNode = hashMapDelete(&g_data.db, &dummyEntry.hashNode, &entry_eq);
+    if(hashNode) {
+        delete container_of(hashNode,Entry, hashNode);
+    }
+}
+
 static void process_commands(Conn *conn,std::vector<std::string> &commands){
     uint32_t status=0;
-    std::vector<uint8_t> result;
+    Response response;
+    response.status = 0;
     if(commands.size() == 2){
         if(commands[0]=="get"){
-            auto it = g_data.find(commands[1]);
-            if(it == g_data.end()){
-                // error status not found
-                status=-1;
-            }
-            else {
-                const std::string &val = it->second;
-                result.assign(val.begin(), val.end());
-            }
+            do_get(commands[1],response);
+            // auto it = g_data.find(commands[1]);
+            // if(it == g_data.end()){
+            //     // error status not found
+            //     status=-1;
+            // }
+            // else {
+            //     const std::string &val = it->second;
+            //     result.assign(val.begin(), val.end());
+            // }
         }
         else if(commands[0]=="del"){
             // status 0
-            g_data.erase(commands[1]);
+            // g_data.erase(commands[1]);
+            do_del(commands[1],response);
         }
         else {
             //error status command not found
@@ -157,17 +247,19 @@ static void process_commands(Conn *conn,std::vector<std::string> &commands){
         }
     }
     else if(commands.size()==3 && commands[0] == "set"){
-        g_data[commands[1]].swap(commands[2]);
+        // g_data[commands[1]].swap(commands[2]);
+        do_set(commands[1],commands[2],response);
     }
     else {
         // error status command not found
         status=-1;
     }
-    uint32_t responseLength=result.size();
+    status = response.status;
+    uint32_t responseLength=response.data.size();
     memcpy(&conn->wBuff[0],&responseLength,4);
     memcpy(&conn->wBuff[4],&status,4);
     conn->wBuffSize  = 8 + responseLength;
-    if(result.size()>0)memcpy(&conn->wBuff[8],result.data(),result.size());
+    if(response.data.size()>0)memcpy(&conn->wBuff[8],response.data.data(),response.data.size());
 }
 
 static int32_t parse_commands(const uint8_t *startPtr,size_t size,std::vector<std::string> &cmds){
